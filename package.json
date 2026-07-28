@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "name": "viboplr-subsonic-browse-tests",
+  "description": "Test harness for the viboplr-subsonic-browse plugin (not published; the plugin itself is just index.js + manifest.json).",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}
