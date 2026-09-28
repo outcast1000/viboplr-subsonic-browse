@@ -12,6 +12,30 @@
 //   - Streaming  -> onResolveStreamByUri("xsonic") + metadata fallback resolver
 //   - Download   -> download provider (by-uri + interactive search/resolve)
 
+// Pure: the host-drawn header over the view (api.ui.setViewHeader, host
+// >= 1.0.77). It says which servers are being browsed and, in one word,
+// whether they answer; the explanation stays in the view (the search status
+// line names unreachable servers, the Manage tab lists each one).
+// `down` is serverId -> true for servers that failed this session. Returns
+// null until the saved servers have loaded, so the header never flashes
+// "No servers" on launch.
+function viewHeaderFor(servers, down, loaded) {
+  if (!loaded) return null;
+  var n = servers.length;
+  if (n === 0) {
+    return { subtitle: "Add a Subsonic or Navidrome server in Manage to start browsing", status: { variant: "muted", label: "No servers" }, actions: [] };
+  }
+  var names = servers.slice(0, 3).map(function (s) { return s.name; });
+  if (n > 3) names.push("+" + (n - 3) + " more");
+  var downCount = 0;
+  for (var i = 0; i < n; i++) if (down[servers[i].id]) downCount++;
+  var status;
+  if (downCount === 0) status = { variant: "success", label: n === 1 ? "Connected" : n + " connected" };
+  else if (downCount === n) status = { variant: "error", label: n === 1 ? "Unreachable" : "All unreachable" };
+  else status = { variant: "warning", label: downCount + " of " + n + " unreachable" };
+  return { subtitle: "Browsing " + names.join(" · "), status: status, actions: [] };
+}
+
 function activate(api) {
   var COMMON = "&v=1.16.1&c=viboplr&f=json";
   var SCHEME = "xsonic";                 // custom track scheme (distinct from core's subsonic://)
@@ -44,6 +68,7 @@ function activate(api) {
     downServers: {},        // serverId -> true (unreachable this session)
     alternates: {},         // "serverId/trackId" -> [{serverId,trackId,serverName}] for failover
     metaCache: {},          // "serverId/trackId" -> {title,artist,album,trackNumber,coverUrl} for downloads
+    loaded: false,          // saved servers read from storage (gates the view header)
   };
 
   // ---- MD5 (blueimp / Paul Johnston, public domain) ---------------------
@@ -599,11 +624,26 @@ function activate(api) {
   }
 
   function renderBrowse() {
+    pushViewHeader();
     if (state.view === "album") return renderAlbumDetail();
     if (state.view === "artist") return renderArtistDetail();
     if (state.view === "servers") return renderServersManage();
     if (state.view === "about") return renderAbout();
     return renderResults();
+  }
+
+  // Sends the header only when it changed: renderBrowse runs on every
+  // keystroke in the Manage form, and each setViewHeader re-renders the host.
+  // Older hosts have no setViewHeader and keep the plain view.
+  var lastViewHeader = null;
+  function pushViewHeader() {
+    if (!api.ui || typeof api.ui.setViewHeader !== "function") return;
+    var header = viewHeaderFor(state.servers, state.downServers, state.loaded);
+    if (!header) return;
+    var key = JSON.stringify(header);
+    if (key === lastViewHeader) return;
+    lastViewHeader = key;
+    api.ui.setViewHeader(VIEW, header);
   }
 
   // ---- Detail sub-views (album / artist) --------------------------------
@@ -1160,10 +1200,12 @@ function activate(api) {
   api.storage.get("servers").then(
     function (saved) {
       if (Array.isArray(saved)) state.servers = saved;
+      state.loaded = true;
       renderBrowse();
     },
     function (e) {
       console.error("subsonic-browse: failed to load servers:", e);
+      state.loaded = true;
       renderBrowse();
     }
   );

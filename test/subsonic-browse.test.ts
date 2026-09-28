@@ -25,7 +25,7 @@ const artist = (o: Any = {}) => ({ id: "ar", name: "Artist", albumCount: 2, cove
 
 interface SearchData { song?: Any[]; album?: Any[]; artist?: Any[]; }
 
-async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchData>; failServerIds?: string[] }) {
+async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchData>; failServerIds?: string[]; noViewHeader?: boolean }) {
   const views: Record<string, any> = {};
   const actions: Record<string, (data?: any) => any> = {};
   const streamResolvers: Record<string, (id: string, q?: any) => any> = {};
@@ -53,6 +53,7 @@ async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchDat
       setViewData: vi.fn((viewId: string, data: any) => { views[viewId] = data; }),
       onAction: vi.fn((id: string, fn: any) => { actions[id] = fn; }),
       showNotification: vi.fn(),
+      ...(opts.noViewHeader ? {} : { setViewHeader: vi.fn() }),
     },
     playback: {
       playTracks,
@@ -76,6 +77,11 @@ async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchDat
   return {
     api, views, actions, streamResolvers, playTracks, view, child, texts,
     fire: (id: string, data?: any) => actions[id]?.(data),
+    headers: () => (api.ui.setViewHeader ? api.ui.setViewHeader.mock.calls : []) as [string, Any][],
+    header: () => {
+      const calls = api.ui.setViewHeader?.mock.calls || [];
+      return calls.length ? calls[calls.length - 1][1] : undefined;
+    },
     async search(query: string) {
       actions["do-search"]?.({ query });
       await vi.waitFor(() => expect(hasEntityTabs()).toBe(true));
@@ -201,5 +207,58 @@ describe("subsonic-browse: relevance sort", () => {
     await env.search("help");
     const titles = env.child("track-row-list").items.map((i: Any) => i.title);
     expect(titles).toEqual(["Help", "Helping Hand", "I Need Help"]);
+  });
+});
+
+describe("subsonic-browse: view header", () => {
+  it("says there are no servers yet, and never before storage has loaded", async () => {
+    const env = await makeEnv({ servers: [] });
+    // The synchronous first render (before storage resolves) must not push.
+    expect(env.headers()).toHaveLength(1);
+    expect(env.headers()[0][0]).toBe("subsonic-browse");
+    expect(env.header()).toEqual({
+      subtitle: "Add a Subsonic or Navidrome server in Manage to start browsing",
+      status: { variant: "muted", label: "No servers" },
+      actions: [],
+    });
+  });
+
+  it("names the servers being browsed and reports them connected", async () => {
+    const env = await makeEnv({ servers: [SERVER_A] });
+    expect(env.header()).toEqual({ subtitle: "Browsing Server A", status: { variant: "success", label: "Connected" }, actions: [] });
+    const env2 = await makeEnv({ servers: [SERVER_A, SERVER_B] });
+    expect(env2.header().subtitle).toBe("Browsing Server A · Server B");
+    expect(env2.header().status).toEqual({ variant: "success", label: "2 connected" });
+  });
+
+  it("collapses a long server list", async () => {
+    const many = ["A", "B", "C", "D", "E"].map((id) => ({ ...SERVER_A, id, name: "S" + id, url: "https://" + id + ".example.com" }));
+    const env = await makeEnv({ servers: many });
+    expect(env.header().subtitle).toBe("Browsing SA · SB · SC · +2 more");
+  });
+
+  it("warns when some servers fail a search and errors when all do", async () => {
+    const env = await makeEnv({ servers: [SERVER_A, SERVER_B], failServerIds: ["A"], search: { B: { song: [song()] } } });
+    await env.search("song");
+    expect(env.header().status).toEqual({ variant: "warning", label: "1 of 2 unreachable" });
+    const env2 = await makeEnv({ servers: [SERVER_A, SERVER_B], failServerIds: ["A", "B"] });
+    await env2.search("song");
+    expect(env2.header().status).toEqual({ variant: "error", label: "All unreachable" });
+  });
+
+  it("only pushes when the header changes", async () => {
+    const env = await makeEnv({ servers: [SERVER_A] });
+    const before = env.headers().length;
+    env.fire("switch-section", { tabId: "manage" });
+    env.fire("add-server-new");
+    env.fire("form-name", { value: "x" });
+    env.fire("switch-section", { tabId: "about" });
+    expect(env.headers().length).toBe(before);
+  });
+
+  it("leaves older hosts without setViewHeader untouched", async () => {
+    const env = await makeEnv({ servers: [SERVER_A], noViewHeader: true });
+    expect(env.api.ui.setViewHeader).toBeUndefined();
+    expect(env.view()).toBeTruthy();
   });
 });
