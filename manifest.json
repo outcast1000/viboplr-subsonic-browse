@@ -1,7 +1,7 @@
 {
   "id": "subsonic-browse",
   "name": "Subsonic Browse",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Viboplr",
   "description": "Search, stream, and download across multiple Subsonic/Navidrome servers live — no indexing. A discovery layer for servers you visit, separate from your indexed Library.",
   "minAppVersion": "0.9.4",

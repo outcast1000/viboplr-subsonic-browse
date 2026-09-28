@@ -14,12 +14,12 @@
 
 // Pure: the host-drawn header over the view (api.ui.setViewHeader, host
 // >= 1.0.77). It says which servers are being browsed and, in one word,
-// whether they answer; the explanation stays in the view (the search status
-// line names unreachable servers, the Manage tab lists each one).
-// `down` is serverId -> true for servers that failed this session. Returns
-// null until the saved servers have loaded, so the header never flashes
-// "No servers" on launch.
-function viewHeaderFor(servers, down, loaded) {
+// whether they answer; the explanation stays in the view (`unreachableBanner`
+// names the servers that don't answer, the Manage tab lists each one).
+// `down` is serverId -> true for servers whose last ping or search failed;
+// `pending` is serverId -> true while a ping is in flight. Returns null until
+// the saved servers have loaded, so the header never flashes "No servers".
+function viewHeaderFor(servers, down, loaded, pending) {
   if (!loaded) return null;
   var n = servers.length;
   if (n === 0) {
@@ -27,13 +27,41 @@ function viewHeaderFor(servers, down, loaded) {
   }
   var names = servers.slice(0, 3).map(function (s) { return s.name; });
   if (n > 3) names.push("+" + (n - 3) + " more");
-  var downCount = 0;
-  for (var i = 0; i < n; i++) if (down[servers[i].id]) downCount++;
+  var downCount = 0, pendingCount = 0;
+  for (var i = 0; i < n; i++) {
+    if (pending && pending[servers[i].id]) pendingCount++;
+    else if (down[servers[i].id]) downCount++;
+  }
   var status;
-  if (downCount === 0) status = { variant: "success", label: n === 1 ? "Connected" : n + " connected" };
+  if (pendingCount > 0) status = { variant: "muted", label: "Checking…" };
+  else if (downCount === 0) status = { variant: "success", label: n === 1 ? "Connected" : n + " connected" };
   else if (downCount === n) status = { variant: "error", label: n === 1 ? "Unreachable" : "All unreachable" };
   else status = { variant: "warning", label: downCount + " of " + n + " unreachable" };
   return { subtitle: "Browsing " + names.join(" · "), status: status, actions: [] };
+}
+
+// Pure: the in-view row naming the servers that don't answer (the header only
+// says how many). Null when every server answered or is still being checked.
+function unreachableBanner(servers, down, pending) {
+  pending = pending || {};
+  var bad = servers.filter(function (s) { return down[s.id] && !pending[s.id]; });
+  if (bad.length === 0) return null;
+  var checking = servers.some(function (s) { return pending[s.id]; });
+  var all = bad.length === servers.length;
+  var one = bad.length === 1;
+  var names = bad.map(function (s) { return s.name; });
+  var list = one ? names[0] : names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+  var text;
+  if (all && !one) text = "None of your servers are answering (" + list + "). Check your connection, or the addresses in Manage.";
+  else if (all) text = list + " isn't answering. Check your connection, or its address in Manage.";
+  else text = list + (one ? " isn't" : " aren't") + " answering — searches skip " + (one ? "it" : "them") + " until " + (one ? "it's" : "they're") + " back.";
+  return {
+    type: "layout", direction: "horizontal", className: "ds-banner ds-banner--" + (all ? "error" : "warning"),
+    children: [
+      { type: "text", content: text },
+      { type: "button", label: checking ? "Checking…" : "Check again", action: "check-servers", variant: "secondary", disabled: checking },
+    ],
+  };
 }
 
 function activate(api) {
@@ -43,6 +71,7 @@ function activate(api) {
   var VIEW = "subsonic-browse";          // sidebar view id
   var SEARCH_TIMEOUT_MS = 8000;          // per-server budget; one slow server can't stall the rest
   var PER_SERVER_LIMIT = 40;
+  var PING_TIMEOUT_MS = 5000;            // reachability check budget per server
 
   // ---- in-memory state --------------------------------------------------
   var state = {
@@ -69,6 +98,8 @@ function activate(api) {
     alternates: {},         // "serverId/trackId" -> [{serverId,trackId,serverName}] for failover
     metaCache: {},          // "serverId/trackId" -> {title,artist,album,trackNumber,coverUrl} for downloads
     loaded: false,          // saved servers read from storage (gates the view header)
+    pinging: {},            // serverId -> true while a reachability ping is in flight
+    pingToken: {},          // serverId -> generation; a superseded ping result is dropped
   };
 
   // ---- MD5 (blueimp / Paul Johnston, public domain) ---------------------
@@ -237,8 +268,8 @@ function activate(api) {
   function streamUrl(server, trackId) { return restUrl(server, "stream.view", "id=" + enc(trackId)); }
   function downloadUrl(server, trackId) { return restUrl(server, "download.view", "id=" + enc(trackId)); }
 
-  async function subsonicGet(server, endpoint, extra) {
-    var resp = await api.network.fetch(restUrl(server, endpoint, extra));
+  async function subsonicGet(server, endpoint, extra, init) {
+    var resp = await api.network.fetch(restUrl(server, endpoint, extra), init);
     var data = await resp.json();
     var r = data && data["subsonic-response"];
     if (!r || r.status !== "ok") {
@@ -326,6 +357,39 @@ function activate(api) {
     }
   }
 
+  // Record what we just learned about a server (a ping or a search answered or
+  // didn't). Bumping the token drops any ping still in flight for it, so an
+  // older check can't overwrite a newer answer.
+  function settleReachability(serverId, ok) {
+    state.pingToken[serverId] = (state.pingToken[serverId] || 0) + 1;
+    delete state.pinging[serverId];
+    if (ok) delete state.downServers[serverId];
+    else state.downServers[serverId] = true;
+  }
+
+  // Ping every given server in parallel (short timeout). Never rejects and
+  // never throws: a failed ping only marks that server unreachable. Runs on
+  // activate and from the banner's "Check again" — never on a timer.
+  function checkServers(servers) {
+    return Promise.all(servers.map(function (server) {
+      var token = (state.pingToken[server.id] || 0) + 1;
+      state.pingToken[server.id] = token;
+      state.pinging[server.id] = true;
+      function done(ok) {
+        if (state.pingToken[server.id] !== token) return; // superseded by a newer answer
+        settleReachability(server.id, ok);
+        renderBrowse();
+      }
+      var p;
+      try { p = subsonicGet(server, "ping.view", null, { timeoutMs: PING_TIMEOUT_MS }); }
+      catch (e) { p = Promise.reject(e); }
+      return p.then(
+        function () { done(true); },
+        function (e) { console.error("subsonic-browse: ping failed on " + server.name + ":", e); done(false); }
+      ).then(null, function (e) { console.error("subsonic-browse: ping handling failed:", e); });
+    }));
+  }
+
   // Never rejects: resolves to a tagged result so one failure can't sink the
   // whole parallel batch. Marks the server up/down for this session.
   function searchServerSafe(server, query, limit) {
@@ -334,14 +398,14 @@ function activate(api) {
       var timer = setTimeout(function () {
         if (done) return;
         done = true;
-        state.downServers[server.id] = true;
+        settleReachability(server.id, false);
         resolve({ server: server, ok: false, songs: [], albums: [], artists: [], error: "timed out" });
       }, SEARCH_TIMEOUT_MS);
       subsonicGet(server, "search3.view", "query=" + enc(query) + "&songCount=" + limit + "&albumCount=" + limit + "&artistCount=" + limit).then(
         function (r) {
           if (done) return;
           done = true; clearTimeout(timer);
-          delete state.downServers[server.id];
+          settleReachability(server.id, true);
           var sr = r.searchResult3 || {};
           resolve({
             server: server, ok: true,
@@ -353,7 +417,7 @@ function activate(api) {
         function (err) {
           if (done) return;
           done = true; clearTimeout(timer);
-          state.downServers[server.id] = true;
+          settleReachability(server.id, false);
           console.error("subsonic-browse: search failed on " + server.name + ":", err);
           resolve({ server: server, ok: false, songs: [], albums: [], artists: [], error: String((err && err.message) || err) });
         }
@@ -610,7 +674,7 @@ function activate(api) {
       children.push({ type: "spacer" });
       children.push({ type: "text", content: state.servers.length + " server" + (state.servers.length > 1 ? "s" : "") + " connected. Type a query to search across all of them at once." });
     }
-    api.ui.setViewData(VIEW, { type: "layout", direction: "vertical", children: children }, { scrollKey: state.query ? "q:" + state.query + ":" + state.activeTab : "home" });
+    api.ui.setViewData(VIEW, { type: "layout", direction: "vertical", children: withBanner(children) }, { scrollKey: state.query ? "q:" + state.query + ":" + state.activeTab : "home" });
   }
 
   // Top-level Search / Manage tab row, shown at the root of both sections.
@@ -632,13 +696,24 @@ function activate(api) {
     return renderResults();
   }
 
+  // Put the unreachable-servers banner first in the scrolling part: after the
+  // leading search box / tab rows, which the host hoists above the scroll area.
+  function withBanner(children) {
+    var banner = unreachableBanner(state.servers, state.downServers, state.pinging);
+    if (!banner) return children;
+    var i = 0;
+    while (i < children.length && (children[i].type === "search-input" || children[i].type === "tabs" || children[i].type === "toolbar")) i++;
+    children.splice(i, 0, banner);
+    return children;
+  }
+
   // Sends the header only when it changed: renderBrowse runs on every
   // keystroke in the Manage form, and each setViewHeader re-renders the host.
   // Older hosts have no setViewHeader and keep the plain view.
   var lastViewHeader = null;
   function pushViewHeader() {
     if (!api.ui || typeof api.ui.setViewHeader !== "function") return;
-    var header = viewHeaderFor(state.servers, state.downServers, state.loaded);
+    var header = viewHeaderFor(state.servers, state.downServers, state.loaded, state.pinging);
     if (!header) return;
     var key = JSON.stringify(header);
     if (key === lastViewHeader) return;
@@ -894,7 +969,7 @@ function activate(api) {
     } else {
       children.push({ type: "spacer" });
       var serverRows = state.servers.map(function (s) {
-        var status = state.downServers[s.id] ? "Unreachable" : "Connected";
+        var status = state.pinging[s.id] ? "Checking…" : state.downServers[s.id] ? "Unreachable" : "Connected";
         return { id: s.id, title: s.name, subtitle: hostOf(s.url) + "  ·  " + status, action: "open-server" };
       });
       var listNode = serverRows.length
@@ -906,7 +981,7 @@ function activate(api) {
       if (state.addStatus) children.push({ type: "text", content: state.addStatus });
     }
 
-    api.ui.setViewData(VIEW, { type: "layout", direction: "vertical", children: children }, { scrollKey: formMode ? (editing ? "manage-edit:" + editing.id : "manage-add") : "servers" });
+    api.ui.setViewData(VIEW, { type: "layout", direction: "vertical", children: formMode ? children : withBanner(children) }, { scrollKey: formMode ? (editing ? "manage-edit:" + editing.id : "manage-add") : "servers" });
   }
 
   // ---- About (in-panel tab) ---------------------------------------------
@@ -1048,13 +1123,14 @@ function activate(api) {
         editing.username = draft.username;
         editing.password = password;
         editing.authMethod = method;
-        delete state.downServers[editing.id];
+        settleReachability(editing.id, true); // detectAuth just pinged it successfully
         await persistServers();
         state.addStatus = "Saved “" + editing.name + "”.";
         api.ui.showNotification("Updated " + editing.name);
       } else {
         var server = { id: genId(), name: f.name || hostOf(draft.url), url: draft.url, username: draft.username, password: password, authMethod: method };
         state.servers.push(server);
+        settleReachability(server.id, true); // detectAuth just pinged it successfully
         await persistServers();
         state.addStatus = "Added “" + server.name + "”.";
         api.ui.showNotification("Connected to " + server.name);
@@ -1070,6 +1146,12 @@ function activate(api) {
       // failure → keep the form open so the user can fix it
     }
     state.adding = false;
+    renderBrowse();
+  });
+
+  // Banner "Check again": re-ping every server.
+  api.ui.onAction("check-servers", function () {
+    checkServers(state.servers);
     renderBrowse();
   });
 
@@ -1090,6 +1172,8 @@ function activate(api) {
     if (!id) { renderBrowse(); return; }
     state.servers = state.servers.filter(function (s) { return s.id !== id; });
     delete state.downServers[id];
+    delete state.pinging[id];
+    state.pingToken[id] = (state.pingToken[id] || 0) + 1;
     persistServers().then(null, function (e) { console.error("subsonic-browse: persist after remove failed:", e); });
     state.editingId = null;
     state.addingNew = false;
@@ -1201,6 +1285,7 @@ function activate(api) {
     function (saved) {
       if (Array.isArray(saved)) state.servers = saved;
       state.loaded = true;
+      checkServers(state.servers);
       renderBrowse();
     },
     function (e) {

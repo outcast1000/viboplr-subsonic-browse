@@ -25,7 +25,7 @@ const artist = (o: Any = {}) => ({ id: "ar", name: "Artist", albumCount: 2, cove
 
 interface SearchData { song?: Any[]; album?: Any[]; artist?: Any[]; }
 
-async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchData>; failServerIds?: string[]; noViewHeader?: boolean }) {
+async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchData>; failServerIds?: string[]; noViewHeader?: boolean; hangPingIds?: string[]; throwPingIds?: string[]; pingFailIds?: string[] }) {
   const views: Record<string, any> = {};
   const actions: Record<string, (data?: any) => any> = {};
   const streamResolvers: Record<string, (id: string, q?: any) => any> = {};
@@ -38,15 +38,22 @@ async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchDat
       set: vi.fn(async () => {}),
     },
     network: {
-      fetch: vi.fn(async (url: string) => {
+      fetch: vi.fn((url: string, _init?: Any) => {
         const server = opts.servers.find((s) => url.startsWith(s.url));
+        const isPing = url.includes("ping.view");
+        // A fetch that throws synchronously (not a rejected promise).
+        if (isPing && server && opts.throwPingIds?.includes(server.id)) throw new Error("fetch blew up");
+        if (isPing && server && opts.hangPingIds?.includes(server.id)) return new Promise(() => {});
+        return (async () => {
         if (server && opts.failServerIds?.includes(server.id)) throw new Error("network down");
+        if (isPing && server && opts.pingFailIds?.includes(server.id)) throw new Error("ping down");
         const body: Any = { "subsonic-response": { status: "ok", version: "1.16.1" } };
         if (url.includes("search3.view") && server) {
           const d = (opts.search && opts.search[server.id]) || {};
           body["subsonic-response"].searchResult3 = { song: d.song || [], album: d.album || [], artist: d.artist || [] };
         }
         return { status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+        })();
       }),
     },
     ui: {
@@ -78,6 +85,7 @@ async function makeEnv(opts: { servers: Any[]; search?: Record<string, SearchDat
     api, views, actions, streamResolvers, playTracks, view, child, texts,
     fire: (id: string, data?: any) => actions[id]?.(data),
     headers: () => (api.ui.setViewHeader ? api.ui.setViewHeader.mock.calls : []) as [string, Any][],
+    banner: () => (view()?.children || []).find((c: Any) => typeof c.className === "string" && c.className.includes("ds-banner")),
     header: () => {
       const calls = api.ui.setViewHeader?.mock.calls || [];
       return calls.length ? calls[calls.length - 1][1] : undefined;
@@ -221,29 +229,81 @@ describe("subsonic-browse: view header", () => {
       status: { variant: "muted", label: "No servers" },
       actions: [],
     });
+    expect(env.banner()).toBeUndefined();
   });
 
-  it("names the servers being browsed and reports them connected", async () => {
+  it("pings every server on activate, with a short timeout", async () => {
+    const env = await makeEnv({ servers: [SERVER_A, SERVER_B] });
+    const pings = env.api.network.fetch.mock.calls.filter((c: Any[]) => String(c[0]).includes("ping.view"));
+    expect(pings).toHaveLength(2);
+    for (const c of pings) expect(c[1]).toEqual({ timeoutMs: 5000 });
+  });
+
+  it("shows Checking… while pings are pending", async () => {
+    const env = await makeEnv({ servers: [SERVER_A, SERVER_B], hangPingIds: ["B"] });
+    expect(env.header()).toEqual({ subtitle: "Browsing Server A · Server B", status: { variant: "muted", label: "Checking…" }, actions: [] });
+    expect(env.banner()).toBeUndefined();
+  });
+
+  it("reports Connected once every ping answers", async () => {
     const env = await makeEnv({ servers: [SERVER_A] });
+    // First "Checking…", then the answer.
+    expect(env.headers()[0][1].status.label).toBe("Checking…");
     expect(env.header()).toEqual({ subtitle: "Browsing Server A", status: { variant: "success", label: "Connected" }, actions: [] });
     const env2 = await makeEnv({ servers: [SERVER_A, SERVER_B] });
     expect(env2.header().subtitle).toBe("Browsing Server A · Server B");
     expect(env2.header().status).toEqual({ variant: "success", label: "2 connected" });
+    expect(env2.banner()).toBeUndefined();
+  });
+
+  it("warns and names the server when some pings fail", async () => {
+    const env = await makeEnv({ servers: [SERVER_A, SERVER_B], pingFailIds: ["A"] });
+    expect(env.header().status).toEqual({ variant: "warning", label: "1 of 2 unreachable" });
+    const b = env.banner();
+    expect(b.className).toContain("ds-banner--warning");
+    expect(b.children[0].content).toContain("Server A isn't answering");
+    expect(b.children[1]).toMatchObject({ action: "check-servers", label: "Check again", disabled: false });
+    // The banner sits below the hoisted tabs + search box.
+    expect(env.view().children[2]).toBe(b);
+  });
+
+  it("errors when every ping fails", async () => {
+    const env = await makeEnv({ servers: [SERVER_A, SERVER_B], pingFailIds: ["A", "B"] });
+    expect(env.header().status).toEqual({ variant: "error", label: "All unreachable" });
+    expect(env.banner().className).toContain("ds-banner--error");
+    expect(env.banner().children[0].content).toContain("None of your servers are answering (Server A and Server B)");
+  });
+
+  it("treats a ping that throws as unreachable without breaking the view", async () => {
+    const env = await makeEnv({ servers: [SERVER_A, SERVER_B], throwPingIds: ["B"] });
+    expect(env.header().status).toEqual({ variant: "warning", label: "1 of 2 unreachable" });
+    expect(env.banner().children[0].content).toContain("Server B");
+    expect(env.child("search-input")).toBeTruthy();
+  });
+
+  it("re-checks from the banner and clears it when the server is back", async () => {
+    const opts = { servers: [SERVER_A], pingFailIds: ["A"] };
+    const env = await makeEnv(opts);
+    expect(env.header().status.label).toBe("Unreachable");
+    opts.pingFailIds = [];
+    env.fire("check-servers");
+    await vi.waitFor(() => expect(env.header().status.label).toBe("Connected"));
+    expect(env.banner()).toBeUndefined();
+  });
+
+  it("lets a search update reachability after the pings", async () => {
+    const env = await makeEnv({ servers: [SERVER_A, SERVER_B], failServerIds: ["A", "B"] });
+    expect(env.header().status.label).toBe("All unreachable");
+    const env2 = await makeEnv({ servers: [SERVER_A, SERVER_B], pingFailIds: ["A"], search: { A: { song: [song()] } } });
+    expect(env2.header().status.label).toBe("1 of 2 unreachable");
+    await env2.search("song");
+    expect(env2.header().status.label).toBe("2 connected");
   });
 
   it("collapses a long server list", async () => {
     const many = ["A", "B", "C", "D", "E"].map((id) => ({ ...SERVER_A, id, name: "S" + id, url: "https://" + id + ".example.com" }));
     const env = await makeEnv({ servers: many });
     expect(env.header().subtitle).toBe("Browsing SA · SB · SC · +2 more");
-  });
-
-  it("warns when some servers fail a search and errors when all do", async () => {
-    const env = await makeEnv({ servers: [SERVER_A, SERVER_B], failServerIds: ["A"], search: { B: { song: [song()] } } });
-    await env.search("song");
-    expect(env.header().status).toEqual({ variant: "warning", label: "1 of 2 unreachable" });
-    const env2 = await makeEnv({ servers: [SERVER_A, SERVER_B], failServerIds: ["A", "B"] });
-    await env2.search("song");
-    expect(env2.header().status).toEqual({ variant: "error", label: "All unreachable" });
   });
 
   it("only pushes when the header changes", async () => {
