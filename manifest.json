@@ -1,10 +1,12 @@
 {
   "id": "subsonic-browse",
   "name": "Subsonic Browse",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "Viboplr",
   "description": "Search, stream, and download across multiple Subsonic/Navidrome servers live — no indexing. A discovery layer for servers you visit, separate from your indexed Library.",
-  "minAppVersion": "0.9.4",
+  "minAppVersion": "1.0.85",
+  "runtime": "worker",
+  "permissions": ["network:*", "playback:read", "playback:control"],
   "viewHeader": {
     "subtitle": "Search, stream and download across your Subsonic and Navidrome servers, live"
   },
