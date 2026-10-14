@@ -268,8 +268,17 @@ function activate(api) {
   function streamUrl(server, trackId) { return restUrl(server, "stream.view", "id=" + enc(trackId)); }
   function downloadUrl(server, trackId) { return restUrl(server, "download.view", "id=" + enc(trackId)); }
 
+  // Name ourselves: the host's default User-Agent is browser-style, which some
+  // filtering proxies block from a non-browser client.
+  var CLIENT_USER_AGENT = "Vibo";
+  function withClientUserAgent(init) {
+    var out = Object.assign({}, init || {});
+    out.headers = Object.assign({ "User-Agent": CLIENT_USER_AGENT }, out.headers || {});
+    return out;
+  }
+
   async function subsonicGet(server, endpoint, extra, init) {
-    var resp = await api.network.fetch(restUrl(server, endpoint, extra), init);
+    var resp = await api.network.fetch(restUrl(server, endpoint, extra), withClientUserAgent(init));
     var data = await resp.json();
     var r = data && data["subsonic-response"];
     if (!r || r.status !== "ok") {
@@ -1274,7 +1283,7 @@ function activate(api) {
     if (!p) return;
     var server = findServer(p.serverId);
     if (!server) return;
-    api.network.fetch(restUrl(server, "scrobble.view", "id=" + enc(p.trackId) + "&submission=true")).then(
+    api.network.fetch(restUrl(server, "scrobble.view", "id=" + enc(p.trackId) + "&submission=true"), withClientUserAgent()).then(
       null,
       function (e) { console.error("subsonic-browse: scrobble-back failed:", e); }
     );

@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.3
+- Requests to your server now identify themselves as `Vibo` instead of using the app's browser-style default, which some company networks (Zscaler) block from a non-browser client.
+
 ## v1.3.2
 - Each permission now says why the plugin needs it, shown under it when Viboplr asks. No functional changes.
 

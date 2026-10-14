@@ -236,7 +236,7 @@ describe("subsonic-browse: view header", () => {
     const env = await makeEnv({ servers: [SERVER_A, SERVER_B] });
     const pings = env.api.network.fetch.mock.calls.filter((c: Any[]) => String(c[0]).includes("ping.view"));
     expect(pings).toHaveLength(2);
-    for (const c of pings) expect(c[1]).toEqual({ timeoutMs: 5000 });
+    for (const c of pings) expect(c[1]).toEqual({ timeoutMs: 5000, headers: { "User-Agent": "Vibo" } });
   });
 
   it("shows Checking… while pings are pending", async () => {
